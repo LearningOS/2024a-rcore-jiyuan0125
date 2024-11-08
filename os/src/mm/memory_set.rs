@@ -72,6 +72,23 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+
+    /// Remove area of [start_va, end_va)
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let vpn_range = VPNRange::new(start_va.floor(), end_va.ceil());
+        match self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range == vpn_range)
+        {
+            Some(ppn) => {
+                let mut area = self.areas.remove(ppn);
+                area.unmap(&mut self.page_table);
+                return 0;
+            }
+            None => return -1,
+        }
+    }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
@@ -299,6 +316,21 @@ impl MemorySet {
         } else {
             false
         }
+    }
+
+    /// Check if the memory is avaiable
+    pub fn memory_is_avaiable(&self, start: usize, len: usize) -> bool {
+        let mut start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(start + len).ceil();
+        while start_vpn < end_vpn {
+            if let Some(pte) = self.translate(start_vpn) {
+                if pte.is_valid() {
+                    return false;
+                }
+            }
+            start_vpn.step();
+        }
+        true
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
