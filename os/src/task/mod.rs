@@ -14,8 +14,11 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::{MAX_SYSCALL_NUM, PAGE_SIZE_BITS};
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{translated_byte_buffer, MapPermission};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -79,6 +82,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.start_time = get_time_us();
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -140,6 +144,9 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            if inner.tasks[next].start_time == 0 {
+                inner.tasks[next].start_time = get_time_us();
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +159,13 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Increase the syscall times of current `Running` task.
+    fn increase_current_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
     }
 }
 
@@ -201,4 +215,142 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Increase the syscall times of current `Running` task.
+pub fn increase_current_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.increase_current_syscall_times(syscall_id);
+}
+
+/// TimeVal structure
+#[repr(C)]
+#[derive(Debug)]
+pub struct TimeVal {
+    /// seconds
+    pub sec: usize,
+    /// microseconds
+    pub usec: usize,
+}
+
+/// Task information
+#[allow(unused)]
+pub struct TaskInfo {
+    /// Task status in it's life cycle
+    status: TaskStatus,
+    /// The numbers of syscall called by task
+    syscall_times: [u32; MAX_SYSCALL_NUM],
+    /// Total running time of task
+    time: usize,
+}
+
+/// Get the current task info
+pub fn get_current_task_info(ti: *mut TaskInfo) {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    let task = &inner.tasks[current];
+    let status = task.task_status;
+    let syscall_times = task.syscall_times;
+    // calculate the total running time of task
+    // as the difference between the current time and the start time
+    // note that the time is in milliseconds
+    let time = (get_time_us() - task.start_time) / 1000;
+    drop(inner);
+    let task_info = TaskInfo {
+        status,
+        syscall_times,
+        time,
+    };
+
+    copy_to_user(ti, &task_info);
+}
+
+/// Get the amount of available memory
+pub fn memory_is_available(start: usize, len: usize) -> bool {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .memory_set
+        .memory_is_avaiable(start, len)
+}
+
+/// Map a virtual address to a physical address
+pub fn get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+
+    copy_to_user(ts, &time_val);
+    0
+}
+
+/// Map a virtual address to a physical address
+pub fn mmap(start: usize, len: usize, port: usize) -> isize {
+    if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+        println!("start address is not page-aligned");
+        return -1;
+    }
+
+    if port & !7 != 0 || port & 7 == 0 {
+        println!("invalid port");
+        return -1;
+    }
+
+    if !memory_is_available(start, len) {
+        println!("memory is not available");
+        return -1;
+    }
+
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    let permission = MapPermission::U | MapPermission::from_bits((port as u8) << 1).unwrap();
+    inner.tasks[current].memory_set.insert_framed_area(
+        start.into(),
+        (start + len).into(),
+        permission,
+    );
+    0
+}
+
+/// Unmap a virtual area
+pub fn munmap(start: usize, len: usize) -> isize {
+    if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+        println!("start address is not page-aligned");
+        return -1;
+    }
+
+    if memory_is_available(start, len) {
+        println!("memory not mapped");
+        return -1;
+    }
+
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .memory_set
+        .remove_framed_area(start.into(), (start + len).into())
+}
+
+/// Copy data from user to kernel
+/// return the length of data copied
+/// return -1 if failed
+pub fn copy_to_user<T>(dst: *mut T, src: &T) -> isize {
+    let token = current_user_token();
+
+    let src_ptr = src as *const _ as *const u8;
+    let dst_ptr = dst as *mut _ as *mut u8;
+
+    let len = core::mem::size_of::<T>();
+    let src_bytes: &[u8] = unsafe { core::slice::from_raw_parts(src_ptr, len) };
+
+    let buffers = translated_byte_buffer(token, dst_ptr, len);
+
+    let mut written_len = 0;
+    for buffer in buffers {
+        buffer.copy_from_slice(&src_bytes[written_len..written_len + buffer.len()]);
+        written_len += buffer.len();
+    }
+
+    written_len as isize
 }
